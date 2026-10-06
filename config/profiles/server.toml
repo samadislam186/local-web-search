@@ -1,0 +1,7 @@
+[runtime]
+profile = "server"
+
+[shards]
+target_size_mb = 256
+max_active_shards = 32
+max_active_bytes = 17179869184

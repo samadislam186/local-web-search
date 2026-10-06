@@ -1,0 +1,7 @@
+[runtime]
+profile = "laptop"
+
+[shards]
+target_size_mb = 100
+max_active_shards = 10
+max_active_bytes = 1073741824

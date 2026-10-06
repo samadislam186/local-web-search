@@ -1,0 +1,16 @@
+[runtime]
+profile = "tiny"
+
+[storage]
+data_root = "data"
+minimum_free_bytes = 104857600
+temporary_retention_seconds = 86400
+
+[shards]
+target_size_mb = 100
+max_active_shards = 10
+max_active_bytes = 1073741824
+
+[crawl]
+sqlite_path = "data/mutable/crawl.sqlite3"
+user_agent = "OpenSearchLocalBot/0.1 (+https://example.invalid/bot)"

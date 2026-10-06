@@ -1,0 +1,7 @@
+[runtime]
+profile = "tiny"
+
+[shards]
+target_size_mb = 25
+max_active_shards = 2
+max_active_bytes = 104857600
