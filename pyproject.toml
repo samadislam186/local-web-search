@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.8"]
 tantivy = ["tantivy>=0.26,<0.27"]
+performance = ["psutil>=5.9"]
 
 [project.scripts]
 open-search = "search_engine.cli:main"

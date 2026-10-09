@@ -6,9 +6,11 @@ import base64
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .storage import ArtifactValidationError
 
@@ -17,6 +19,26 @@ from .storage import ArtifactValidationError
 class DetachedSignature:
     key_id: str
     signature_b64: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseSigner:
+    key_id: str
+    private_key: Ed25519PrivateKey
+
+    @classmethod
+    def from_pem(cls, path: Path, key_id: str) -> ReleaseSigner:
+        key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+        if not isinstance(key, Ed25519PrivateKey) or not key_id.strip():
+            raise ValueError("release signing requires an Ed25519 PEM key and non-empty key ID")
+        return cls(key_id, key)
+
+    def sign(self, payload: bytes) -> DetachedSignature:
+        return DetachedSignature(self.key_id, base64.b64encode(self.private_key.sign(payload)).decode("ascii"))
+
+    def verifier(self) -> PinnedKeyVerifier:
+        raw = self.private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        return PinnedKeyVerifier({self.key_id: base64.b64encode(raw).decode("ascii")})
 
 
 class PinnedKeyVerifier:

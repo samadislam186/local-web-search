@@ -34,6 +34,10 @@ def test_search_service_plans_merges_and_ranks() -> None:
     assert response.plan.candidate_shards[0].shard_id == "s1"
 
 
+def test_search_service_applies_domain_filter_embedded_in_query() -> None:
+    assert _service().search("site:other.example python").results == ()
+
+
 def test_search_service_bounds_per_shard_top_k_and_merges_duplicate_ids() -> None:
     document = _document("https://example.com/python", "Python", "crawler")
 
@@ -86,6 +90,14 @@ def test_api_exposes_search_and_explain_mode() -> None:
     response = client.post("/search", json={"query": "python", "explain": True})
     assert response.status_code == 200
     assert response.json()["results"][0]["features"]["authority"] == 1.0
+    assert response.json()["results"][0]["contributions"]["authority"] == pytest.approx(0.15)
+    assert response.json()["pagination"] == {"top_k": 10, "offset": 0, "returned": 2}
+    assert response.json()["routing"]["budget_exhausted"] is False
+    assert len(response.headers["X-Request-ID"]) == 32
+    metrics = client.get("/metrics").json()
+    assert metrics["generation"] == "g1"
+    assert metrics["counters"]["query_count"] == 1
+    assert metrics["observations"]["ranking_latency_ms"]["count"] == 1
     assert response.json()["results"][0]["snippet"] == "crawl the web"
     paged = client.post("/search", json={"query": "python", "top_k": 1, "offset": 1})
     assert paged.json()["results"][0]["rank"] == 2

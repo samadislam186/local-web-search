@@ -1,14 +1,19 @@
 from pathlib import Path
 
+import pytest
 from search_engine.canonicalization import canonicalize_url
 from search_engine.crawl_processing import CrawlResultProcessor
 from search_engine.crawl_store import CrawledDocumentRepository
 from search_engine.index_builder import LocalIndexBuilder
 from search_engine.publisher import load_active_search_service
 from search_engine.state import CandidateRepository, CrawlStateDatabase, UrlState
+from search_engine.tantivy_adapter import tantivy_capability
 
 
-def test_local_index_builder_publishes_pending_crawl_documents(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ("reference", "tantivy"))
+def test_local_index_builder_publishes_pending_crawl_documents(tmp_path: Path, backend: str) -> None:
+    if backend == "tantivy" and not tantivy_capability().available:
+        pytest.skip("Tantivy is not installed")
     database = CrawlStateDatabase(tmp_path / "crawl.sqlite3")
     database.initialize()
     candidates = CandidateRepository(database)
@@ -20,7 +25,7 @@ def test_local_index_builder_publishes_pending_crawl_documents(tmp_path: Path) -
     )
     documents = CrawledDocumentRepository(database)
     documents.save(crawled)
-    result = LocalIndexBuilder(documents, candidates).build(tmp_path / "artifacts", "g000001", max_documents=10)
+    result = LocalIndexBuilder(documents, candidates).build(tmp_path / "artifacts", "g000001", max_documents=10, backend=backend)
     service = load_active_search_service(tmp_path / "artifacts", require_signatures=False)
     assert (result.document_count, result.shard_count) == (1, 1)
     assert service.search("python crawler").results[0].hit.url == "https://example.com/python"
@@ -33,7 +38,7 @@ def test_local_index_builder_publishes_pending_crawl_documents(tmp_path: Path) -
         second_id, "<title>Rust crawler</title><p>Build another local search index.</p>"
     )
     documents.save(second)
-    rebuilt = LocalIndexBuilder(documents, candidates).build(tmp_path / "artifacts", "g000002", max_documents=10)
+    rebuilt = LocalIndexBuilder(documents, candidates).build(tmp_path / "artifacts", "g000002", max_documents=10, backend=backend)
     reloaded = load_active_search_service(tmp_path / "artifacts", require_signatures=False)
     assert rebuilt.document_count == 2
     assert reloaded.search("python crawler").results[0].hit.url == "https://example.com/python"

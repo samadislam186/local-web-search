@@ -25,6 +25,10 @@ def test_metrics_registry_and_search_service_report_execution() -> None:
     service = service_for_tests()
     service.search("python")
     assert service.stats()["query_count"] == 1
+    for value in range(10000):
+        registry.observe("many", float(value))
+    assert registry.snapshot().observations["many"]["count"] == 10000
+    assert len(registry._observations["many"]) == 4
 
 
 def test_json_events_include_correlation_and_reject_sensitive_fields() -> None:
@@ -44,3 +48,11 @@ def test_json_events_include_correlation_and_reject_sensitive_fields() -> None:
     with pytest.raises(ValueError, match="sensitive"):
         log_event(logger, "query_completed", url="https://example.com/")
     assert NoopMetricsRegistry().snapshot().counters == {}
+
+
+def test_event_correlation_survives_formatting_after_request_context(caplog) -> None:
+    logger = logging.getLogger("search-engine-deferred-event")
+    with caplog.at_level(logging.INFO, logger=logger.name), correlation_context("request-deferred"):
+        log_event(logger, "query_completed", result_count=1)
+    record = next(record for record in caplog.records if record.name == logger.name)
+    assert json.loads(JsonEventFormatter().format(record))["correlation_id"] == "request-deferred"

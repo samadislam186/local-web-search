@@ -11,12 +11,45 @@ from search_engine.state import (
     CrawlStateDatabase,
     FrontierRepository,
     LivenessRepository,
+    UrlState,
 )
 
 
 class _Resolver:
     def resolve(self, _hostname: str, _port: int) -> DnsResult:
         return DnsResult(DnsStatus.RESOLVABLE, ("8.8.8.8",))
+
+
+def test_dns_outage_recovers_after_worker_restart_and_persisted_backoff(tmp_path: Path) -> None:
+    database_path = tmp_path / "crawl.sqlite3"
+    database = CrawlStateDatabase(database_path)
+    database.initialize()
+    candidates = CandidateRepository(database)
+    url_id = candidates.upsert(canonicalize_url("https://example.com/"), "seed")
+
+    class OutageResolver:
+        def resolve(self, _hostname: str, _port: int) -> DnsResult:
+            return DnsResult(DnsStatus.TEMPORARY_FAILURE, error="DNS outage")
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    worker = LivenessWorker(candidates, LivenessRepository(database), resolver=OutageResolver())
+    runner = LivenessRunner(candidates, worker, FrontierRepository(database))
+    assert runner.run(max_candidates=1, now=start).unavailable == 1
+    assert candidates.get_state(url_id) is UrlState.TEMPORARILY_UNAVAILABLE
+
+    restarted_database = CrawlStateDatabase(database_path)
+    restarted_candidates = CandidateRepository(restarted_database)
+    restored_worker = LivenessWorker(
+        restarted_candidates,
+        LivenessRepository(restarted_database),
+        resolver=_Resolver(),
+        probe=SafeHttpProbe(_Resolver(), transport=lambda *_args: FetchResult(200, {}, b"ok")),
+    )
+    restarted = LivenessRunner(restarted_candidates, restored_worker, FrontierRepository(restarted_database))
+    assert restarted.run(max_candidates=1, now=start + timedelta(minutes=4)).checked == 0
+    assert restarted.run(max_candidates=1, now=start + timedelta(minutes=5)).promoted_to_frontier == 1
+    assert restarted_candidates.get_state(url_id) is UrlState.LIVE
+    assert LivenessRepository(restarted_database).retry_count(url_id) == 0
 
 
 def test_liveness_runner_promotes_only_live_candidates_to_frontier(tmp_path: Path) -> None:

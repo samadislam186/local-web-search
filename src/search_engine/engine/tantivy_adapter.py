@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
+import re
+import tempfile
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -11,6 +15,7 @@ from urllib.parse import urlsplit
 from .identity import UrlId
 from .index import SearchDocument, SearchHit
 from .snippets import make_snippet
+from .storage import MAX_SHARD_PAYLOAD_BYTES, ArtifactValidationError
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +54,57 @@ class TantivyIndex:
 
     def __init__(self, index: object) -> None:
         self._index = index
+        self._temporary = None
+
+    @classmethod
+    def build_payload(cls, documents: tuple[SearchDocument, ...]) -> bytes:
+        """Package native static index files inside the checksumed shard envelope."""
+        from .index import Bm25fIndex
+
+        with tempfile.TemporaryDirectory(prefix="search-tantivy-build-") as directory:
+            path = Path(directory)
+            built = cls.build(path, documents)
+            del built
+            files = {
+                item.name: base64.b64encode(item.read_bytes()).decode("ascii")
+                for item in sorted(path.iterdir())
+                if item.is_file() and not item.name.startswith(".") and not item.name.endswith(".lock")
+            }
+            payload = json.dumps(
+                {"format_version": 1, "backend_version": tantivy_capability().version,
+                 "documents": json.loads(Bm25fIndex(documents).to_payload()), "files": files},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+            if len(payload) > MAX_SHARD_PAYLOAD_BYTES:
+                raise ValueError("native index payload exceeds shard size limit")
+            return payload
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> TantivyIndex:
+        package = _native_package(payload)
+        require_tantivy()
+        if package["backend_version"] != tantivy_capability().version:
+            raise ArtifactValidationError("Tantivy backend version mismatch; rebuild the generation")
+        temporary = tempfile.TemporaryDirectory(prefix="search-tantivy-reader-")
+        try:
+            path = Path(temporary.name)
+            for name, encoded in package["files"].items():
+                (path / name).write_bytes(base64.b64decode(encoded, validate=True))
+            result = cls.open(path)
+            result._temporary = temporary
+            return result
+        except (ValueError, RuntimeError, OSError) as exc:
+            temporary.cleanup()
+            raise ArtifactValidationError("cannot open native index package") from exc
+
+    def close(self) -> None:
+        self._index = None
+        if self._temporary is not None:
+            self._temporary.cleanup()
+            self._temporary = None
+
+    def __del__(self) -> None:
+        self.close()
 
     @classmethod
     def build(cls, path: Path, documents: tuple[SearchDocument, ...]) -> TantivyIndex:
@@ -57,7 +113,9 @@ class TantivyIndex:
         builder = tantivy.SchemaBuilder()
         for field in ("url_id", *cls._TEXT_FIELDS):
             builder.add_text_field(field, stored=True)
+        builder.add_text_field("crawled_at", stored=True)
         index = tantivy.Index(builder.build(), str(path))
+        index.config_reader(reload_policy="Manual")
         writer = index.writer(15_000_000, 1)
         for document in documents:
             host = document.host or _host_from_url(document.url)
@@ -72,6 +130,7 @@ class TantivyIndex:
                     anchor=document.anchor,
                     host=host,
                     domain=domain,
+                    crawled_at=document.crawled_at or "",
                 )
             )
         writer.commit()
@@ -80,7 +139,9 @@ class TantivyIndex:
 
     @classmethod
     def open(cls, path: Path) -> TantivyIndex:
-        return cls(_tantivy().Index.open(str(path)))
+        index = _tantivy().Index.open(str(path))
+        index.config_reader(reload_policy="Manual")
+        return cls(index)
 
     def search(self, query: str, top_k: int) -> tuple[SearchHit, ...]:
         if top_k <= 0:
@@ -107,7 +168,8 @@ class TantivyIndex:
             url = _stored_value(document, "url")
             title = _stored_value(document, "title")
             body = _stored_value(document, "body")
-            hits.append(SearchHit(url_id, float(score), title, url, make_snippet(body, query)))
+            timestamp = document.get("crawled_at", [""])[0] or None
+            hits.append(SearchHit(url_id, float(score), title, url, make_snippet(body, query), timestamp))
         return tuple(sorted(hits, key=lambda hit: (-hit.score, hit.url_id.hex)))
 
 
@@ -130,3 +192,31 @@ def _host_from_url(url: str) -> str:
     if not host:
         raise ValueError(f"search document URL has no host: {url!r}")
     return host.casefold()
+
+
+def native_documents(payload: bytes) -> tuple[SearchDocument, ...]:
+    from .index import Bm25fIndex
+
+    return Bm25fIndex.from_payload(json.dumps(_native_package(payload)["documents"]).encode()).documents
+
+
+def _native_package(payload: bytes) -> dict:
+    if len(payload) > MAX_SHARD_PAYLOAD_BYTES:
+        raise ArtifactValidationError("native payload exceeds size limit")
+    try:
+        package = json.loads(payload)
+        if package["format_version"] != 1 or not isinstance(package["files"], dict):
+            raise ValueError("invalid native package format")
+        if not isinstance(package["backend_version"], str) or not isinstance(package["documents"], list):
+            raise TypeError("native package requires backend version and source records")
+        if "meta.json" not in package["files"] or len(package["files"]) > 4096:
+            raise ValueError("invalid native file inventory")
+        for name, encoded in package["files"].items():
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name) or ":" in name:
+                raise ValueError("unsafe native file name")
+            if name.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)), *(f"LPT{i}" for i in range(10))}:
+                raise ValueError("reserved native file name")
+            base64.b64decode(encoded, validate=True)
+        return package
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactValidationError("invalid native index package") from exc

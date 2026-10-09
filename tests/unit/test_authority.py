@@ -30,3 +30,11 @@ def test_published_authority_signals_load_into_active_service(tmp_path: Path) ->
     )
     service = load_active_search_service(tmp_path, require_signatures=False)
     assert service.signals[document.url_id.hex].authority == 0.75
+
+
+def test_active_service_safely_defaults_authority_when_a_generation_has_no_authority_shard(tmp_path: Path) -> None:
+    document = _document("https://example.com/")
+    publish_lexical_generation(tmp_path, "g1", {"s1": (document,)})
+    result = load_active_search_service(tmp_path, require_signatures=False).search("python", explain=True).results[0]
+    assert result.features["authority"] == 0.0
+    assert result.contributions["authority"] == 0.0

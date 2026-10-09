@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from .api import create_app
+from .api import create_generation_app
+from .config import load_profile
 from .engine.canonicalization import canonicalize_url
 from .engine.common_crawl.client import CommonCrawlIndexClient
 from .engine.common_crawl.ingestion import CommonCrawlIngestor, IngestionStats
@@ -15,15 +18,17 @@ from .engine.crawl_processing import CrawlResultProcessor
 from .engine.crawl_store import CrawledDocumentRepository
 from .engine.crawler_runner import CrawlerRunner, CrawlRunStats
 from .engine.crawler_worker import CrawlerWorker
+from .engine.evaluation import benchmark_search
 from .engine.feedback import SqliteFeedbackAggregator
 from .engine.fetch import SafeHttpProbe
 from .engine.identity import UrlId
 from .engine.index_builder import IndexBuildResult, LocalIndexBuilder
 from .engine.liveness_runner import LivenessRunner, LivenessRunStats
 from .engine.liveness_worker import LivenessWorker
+from .engine.observability import JsonEventFormatter, correlation_context
 from .engine.publisher import load_active_search_service
 from .engine.robots_manager import RobotsManager
-from .engine.security import PinnedKeyVerifier
+from .engine.security import PinnedKeyVerifier, ReleaseSigner
 from .engine.state import (
     CandidateRepository,
     CommonCrawlPlanRepository,
@@ -43,6 +48,17 @@ class SeedResult:
 
 
 def main() -> None:
+    logger = logging.getLogger("search_engine")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(JsonEventFormatter())
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    with correlation_context():
+        _main()
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(prog="open-search")
     commands = parser.add_subparsers(dest="command", required=True)
     canonicalize = commands.add_parser("canonicalize")
@@ -73,6 +89,11 @@ def main() -> None:
     build_index.add_argument("--max-documents", type=int, default=10_000)
     build_index.add_argument("--shard-count", type=int, default=1)
     build_index.add_argument("--target-shard-bytes", type=int)
+    build_index.add_argument("--backend", choices=("reference", "tantivy"), default="tantivy")
+    build_index.add_argument("--profile", choices=("tiny", "laptop", "server"))
+    build_index.add_argument("--config-root", type=Path, default=Path("config"))
+    build_index.add_argument("--signing-key", type=Path, help="local Ed25519 private PEM file")
+    build_index.add_argument("--signing-key-id")
     liveness_run = commands.add_parser("run-liveness")
     liveness_run.add_argument("database", type=Path)
     liveness_run.add_argument("--max-candidates", type=int, default=100)
@@ -87,6 +108,8 @@ def main() -> None:
     serve.add_argument("root", type=Path, help="published generation root")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--profile", choices=("tiny", "laptop", "server"))
+    serve.add_argument("--config-root", type=Path, default=Path("config"))
     serve.add_argument(
         "--pinned-key",
         action="append",
@@ -113,7 +136,15 @@ def main() -> None:
         type=Path,
         help="optional separate SQLite database for persistent local feedback aggregates",
     )
+    benchmark_command = commands.add_parser("benchmark-search")
+    benchmark_command.add_argument("root", type=Path)
+    benchmark_command.add_argument("query")
+    benchmark_command.add_argument("--runs", type=int, default=20)
+    benchmark_command.add_argument("--warmup-runs", type=int, default=1)
+    benchmark_command.add_argument("--allow-unsigned-local", action="store_true")
+    benchmark_command.add_argument("--pinned-key", action="append", default=[])
     args = parser.parse_args()
+    profile = load_profile(args.config_root, args.profile) if getattr(args, "profile", None) else None
     if args.command == "canonicalize":
         url = canonicalize_url(args.url)
         print(f"canonical_url={url.value}")
@@ -150,13 +181,20 @@ def main() -> None:
         for collection in collections:
             print(f"crawl_id={collection.crawl_id}\tname={collection.name}\tindex_url={collection.index_url}")
     elif args.command == "build-index":
+        if (args.signing_key is None) != (args.signing_key_id is None):
+            parser.error("--signing-key and --signing-key-id must be provided together")
+        signer = ReleaseSigner.from_pem(args.signing_key, args.signing_key_id) if args.signing_key else None
         result = _build_index(
             args.database,
             args.root,
             args.generation,
             args.max_documents,
             args.shard_count,
-            args.target_shard_bytes,
+            args.target_shard_bytes if args.target_shard_bytes is not None else (
+                profile.shards.target_size_mb * 1024 * 1024 if profile else None
+            ),
+            args.backend,
+            signer,
         )
         print(f"generation={result.manifest.generation}")
         print(f"documents={result.document_count}")
@@ -172,6 +210,13 @@ def main() -> None:
         print(f"completed={stats.completed}")
         print(f"requeued={stats.requeued}")
         print(f"idle={stats.idle}")
+    elif args.command == "benchmark-search":
+        roots = _parse_pinned_keys(args.pinned_key)
+        verifier = PinnedKeyVerifier(roots) if roots else None
+        service = load_active_search_service(
+            args.root, require_signatures=not args.allow_unsigned_local, verifier=verifier
+        )
+        print(benchmark_search(service, args.query, runs=args.runs, warmup_runs=args.warmup_runs).to_json())
     else:
         _serve(
             args.root,
@@ -182,6 +227,8 @@ def main() -> None:
             args.enable_local_feedback,
             args.feedback_salt_hex,
             args.feedback_db,
+            profile.shards.max_active_shards if profile else 10,
+            profile.shards.max_active_bytes if profile else 1 << 30,
         )
 
 
@@ -194,6 +241,8 @@ def _serve(
     enable_local_feedback: bool = False,
     feedback_salt_hex: str | None = None,
     feedback_database: Path | None = None,
+    max_active_shards: int = 10,
+    max_active_bytes: int = 1 << 30,
 ) -> None:
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
@@ -201,7 +250,17 @@ def _serve(
     if not allow_unsigned_local and not roots:
         raise ValueError("at least one --pinned-key is required unless --allow-unsigned-local is set")
     verifier = None if allow_unsigned_local else PinnedKeyVerifier(roots)
-    service = load_active_search_service(root, require_signatures=not allow_unsigned_local, verifier=verifier)
+    app, service = create_generation_app(
+        root, require_signatures=not allow_unsigned_local, verifier=verifier,
+        max_shards=max_active_shards, byte_budget=max_active_bytes,
+        max_active_shards=max_active_shards, max_active_bytes=max_active_bytes,
+    )
+    logger = logging.getLogger("search_engine")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(JsonEventFormatter())
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
     if enable_local_feedback:
         if feedback_salt_hex is None:
             raise ValueError("--feedback-salt-hex is required with --enable-local-feedback")
@@ -215,7 +274,6 @@ def _serve(
         service.feedback_salt = feedback_salt
     elif feedback_salt_hex is not None or feedback_database is not None:
         raise ValueError("feedback options require --enable-local-feedback")
-    app = create_app(service, generation=service.planner.metadata.generation)
     import uvicorn
 
     uvicorn.run(app, host=host, port=port)
@@ -228,6 +286,8 @@ def _build_index(
     max_documents: int,
     shard_count: int,
     target_shard_payload_bytes: int | None = None,
+    backend: str = "reference",
+    signer: ReleaseSigner | None = None,
 ) -> IndexBuildResult:
     database = CrawlStateDatabase(database_path)
     database.initialize()
@@ -237,6 +297,8 @@ def _build_index(
         max_documents=max_documents,
         shard_count=shard_count,
         target_shard_payload_bytes=target_shard_payload_bytes,
+        backend=backend,
+        signer=signer,
     )
 
 

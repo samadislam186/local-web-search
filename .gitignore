@@ -3,4 +3,5 @@ __pycache__/
 .pytest-*/
 .wheel-test/
 .demo-run-*/
+.scale-verification-*/
 .idea/

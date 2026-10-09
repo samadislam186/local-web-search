@@ -57,7 +57,7 @@ class CrawledDocumentRepository:
         with self.database.connection() as connection:
             rows = connection.execute(
                 """SELECT documents.url_id, candidates.canonical_url, documents.title, documents.body,
-                          documents.headings_json, documents.anchor_json
+                          documents.headings_json, documents.anchor_json, documents.crawled_at
                    FROM crawled_documents AS documents
                    JOIN candidates ON candidates.url_id=documents.url_id
                    WHERE documents.indexed_generation IS NULL
@@ -72,6 +72,7 @@ class CrawledDocumentRepository:
                 str(row["body"]),
                 " ".join(json.loads(str(row["headings_json"]))),
                 " ".join(text for _url, text in json.loads(str(row["anchor_json"]))),
+                crawled_at=str(row["crawled_at"]),
             )
             for row in rows
         )

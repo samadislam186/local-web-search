@@ -269,6 +269,8 @@ def safe_generation(value: str) -> str:
 
 
 def _validate_manifest_metadata(manifest: Manifest) -> None:
+    if manifest.canonicalization_version != 1 or manifest.url_id_version != 1:
+        raise ArtifactValidationError("unsupported manifest identity versions")
     if not manifest.dependencies or any(
         not isinstance(name, str) or not name or not isinstance(version, int) or isinstance(version, bool) or version <= 0
         for name, version in manifest.dependencies.items()

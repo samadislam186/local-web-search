@@ -39,6 +39,15 @@ class AssignmentBalanceReport:
 
 
 @dataclass(frozen=True, slots=True)
+class RoutingStrategyDecision:
+    outcome: str
+    assignment: str | None
+    max_shards: int | None
+    containment: float | None
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoutingBudgetSweep:
     """Routing quality and cost measured across shard-count budgets."""
 
@@ -111,6 +120,81 @@ def compare_assignments(
     return tuple(
         run_experiment(name, segments, queries, top_k=top_k, max_shards=max_shards)
         for name, segments in assignments
+    )
+
+
+def compare_assignment_sweeps(
+    documents: tuple[SearchDocument, ...],
+    queries: tuple[str, ...],
+    *,
+    shard_count: int,
+    top_k: int = 10,
+    shard_budgets: tuple[int, ...] = (1, 2, 5, 10),
+    byte_budget: int = 1 << 30,
+) -> dict[str, RoutingBudgetSweep]:
+    """Measure every assignment candidate under the same shard-budget sweep."""
+    assignments = {
+        "hash": hash_assignment(documents, shard_count),
+        "domain": domain_assignment(documents, shard_count),
+        "hybrid": hybrid_assignment(documents, shard_count),
+    }
+    return {
+        name: sweep_shard_budgets(
+            name,
+            segments,
+            queries,
+            top_k=top_k,
+            shard_budgets=shard_budgets,
+            byte_budget=byte_budget,
+        )
+        for name, segments in assignments.items()
+    }
+
+
+def assignment_sweep_report(
+    sweeps: dict[str, RoutingBudgetSweep], shard_budgets: tuple[int, ...]
+) -> dict[str, object]:
+    """Return a stable machine-readable comparison suitable for a go/no-go record."""
+    if not sweeps:
+        raise ValueError("at least one assignment sweep is required")
+    return {
+        "format_version": 1,
+        "shard_budgets": shard_budgets,
+        "assignments": {name: sweeps[name].to_dict(shard_budgets) for name in sorted(sweeps)},
+    }
+
+
+def select_routing_strategy(
+    sweeps: dict[str, RoutingBudgetSweep],
+    shard_budgets: tuple[int, ...],
+    *,
+    minimum_containment: float,
+) -> RoutingStrategyDecision:
+    """Choose the cheapest measured strategy meeting an explicit containment target."""
+    if not 0 < minimum_containment <= 1:
+        raise ValueError("minimum_containment must be in (0, 1]")
+    candidates: list[tuple[float, int, str, RoutingExperimentResult]] = []
+    for assignment, sweep in sweeps.items():
+        if len(sweep.points) != len(shard_budgets):
+            raise ValueError("sweep points must align with shard budgets")
+        for budget, point in zip(shard_budgets, sweep.points, strict=True):
+            if point.mean_top_k_containment >= minimum_containment:
+                candidates.append((point.mean_bytes_opened, budget, assignment, point))
+    if not candidates:
+        return RoutingStrategyDecision(
+            "revise",
+            None,
+            None,
+            None,
+            f"no strategy met containment target {minimum_containment:.3f}; revise routing architecture",
+        )
+    _bytes, budget, assignment, point = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return RoutingStrategyDecision(
+        "select",
+        assignment,
+        budget,
+        point.mean_top_k_containment,
+        f"measured containment {point.mean_top_k_containment:.3f} meets target {minimum_containment:.3f}",
     )
 
 

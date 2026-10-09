@@ -13,8 +13,10 @@ from .index import Bm25fIndex, SearchDocument
 from .manifest import Manifest, ManifestStore
 from .pagerank import compute_pagerank
 from .publisher import publish_lexical_generation
+from .security import ReleaseSigner
 from .state import CandidateRepository, UrlState
 from .storage import read_shard
+from .tantivy_adapter import native_documents
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,8 @@ class LocalIndexBuilder:
         shard_count: int = 1,
         target_shard_payload_bytes: int | None = None,
         authority_scores: dict[str, float] | None = None,
+        backend: str = "reference",
+        signer: ReleaseSigner | None = None,
     ) -> IndexBuildResult:
         if shard_count <= 0:
             raise ValueError("shard_count must be positive")
@@ -58,6 +62,8 @@ class LocalIndexBuilder:
             segments,
             authority_scores=scores,
             target_shard_payload_bytes=target_shard_payload_bytes,
+            backend=backend,
+            signer=signer,
         )
         self.documents.mark_indexed((document.url_id for document in batch), manifest.generation)
         for document in batch:
@@ -66,7 +72,7 @@ class LocalIndexBuilder:
         return IndexBuildResult(
             manifest,
             len(snapshot),
-            sum(artifact.header.shard_type == "lexical_index" for artifact in manifest.artifacts),
+            sum(artifact.header.shard_type in {"lexical_index", "tantivy_index"} for artifact in manifest.artifacts),
         )
 
 
@@ -85,10 +91,10 @@ def _active_documents(root: Path) -> tuple[SearchDocument, ...]:
     manifest = store.active_manifest()
     documents: list[SearchDocument] = []
     for artifact in manifest.artifacts:
-        if artifact.header.shard_type != "lexical_index":
+        if artifact.header.shard_type not in {"lexical_index", "tantivy_index"}:
             continue
         _header, payload = read_shard(store.generations / manifest.generation / artifact.relative_path)
-        documents.extend(Bm25fIndex.from_payload(payload).documents)
+        documents.extend(native_documents(payload) if artifact.header.shard_type == "tantivy_index" else Bm25fIndex.from_payload(payload).documents)
     return tuple(documents)
 
 

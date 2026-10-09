@@ -14,10 +14,8 @@ def search_web(
     domain_filter: str | None = None,
     language: str | None = None,
 ) -> list[dict[str, object]]:
-    """Return portable result evidence; freshness/domain filtering are reserved until indexed metadata exists."""
-    if freshness is not None:
-        raise ValueError("freshness requires indexed metadata and is not implemented yet")
-    response = service.search(query, top_k=top_k, language=language, domain_filter=domain_filter)
+    """Return portable result evidence without coupling the adapter to an LLM runtime."""
+    response = service.search(query, top_k=top_k, language=language, domain_filter=domain_filter, freshness=freshness)
     return [
         {
             "url": result.hit.url,

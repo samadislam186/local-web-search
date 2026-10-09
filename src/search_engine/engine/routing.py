@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
+from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 
 from blake3 import blake3
 
+from .query_analysis import QueryAnalysis, analyze_query
 from .storage import ArtifactValidationError
 
 ROUTING_METADATA_VERSION = 1
@@ -55,10 +57,23 @@ class ShardRoutingMetadata:
     bloom: BloomFilter
     languages: tuple[str, ...] = ()
     hotness: float = 0.0
+    term_min: str | None = None
+    term_max: str | None = None
+    estimated_open_ms: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.document_count < 0 or self.byte_size <= 0:
+        if self.document_count < 0 or self.byte_size <= 0 or self.estimated_open_ms < 0:
             raise ValueError("routing shard document_count must be non-negative and byte_size positive")
+        if self.terms != tuple(sorted(set(self.terms))):
+            raise ValueError("routing terms must be sorted and unique")
+        if (self.term_min is None) != (self.term_max is None) or (
+            self.term_min is not None and self.term_max is not None and self.term_min > self.term_max
+        ):
+            raise ValueError("routing shard term range must be complete and ordered")
+        if self.terms and self.term_min is not None and (
+            self.term_min != self.terms[0] or self.term_max != self.terms[-1]
+        ):
+            raise ValueError("routing range must cover the complete term summary")
 
     @classmethod
     def from_terms(
@@ -71,9 +86,33 @@ class ShardRoutingMetadata:
         *,
         languages: Iterable[str] = (),
         hotness: float = 0.0,
+        estimated_open_ms: float = 0.0,
     ) -> ShardRoutingMetadata:
         normalized = tuple(sorted(set(_terms(" ".join(terms)))))
-        return cls(shard_id, generation, document_count, byte_size, normalized, BloomFilter.build(normalized), tuple(sorted(set(languages))), hotness)
+        return cls(
+            shard_id,
+            generation,
+            document_count,
+            byte_size,
+            normalized,
+            BloomFilter.build(normalized, bit_count=max(4096, len(normalized) * 12), hash_count=8),
+            tuple(sorted(set(languages))),
+            hotness,
+            normalized[0] if normalized else None,
+            normalized[-1] if normalized else None,
+            estimated_open_ms,
+        )
+
+    def may_have_term(self, term: str) -> bool:
+        """Use a zero-false-negative lexical range guard before the Bloom lookup."""
+        if self.term_min is not None and (term < self.term_min or term > self.term_max):
+            return False
+        return self.has_exact_term(term) or self.bloom.may_contain(term)
+
+    def has_exact_term(self, term: str) -> bool:
+        """Binary-search the immutable sorted term summary without Bloom uncertainty."""
+        position = bisect_left(self.terms, term)
+        return position < len(self.terms) and self.terms[position] == term
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,27 +183,53 @@ class QueryPlan:
     max_shards: int
     byte_budget: int
     stopped_early: bool = False
+    analysis: QueryAnalysis | None = None
+    estimated_latency_ms: float = 0.0
+    stop_reason: str | None = None
+    budget_exhausted: bool = False
 
 
 class QueryPlanner:
     def __init__(
-        self, metadata: RoutingMetadata, *, max_shards: int = 10, byte_budget: int = 1 << 30, minimum_score: float = 0.0
+        self,
+        metadata: RoutingMetadata,
+        *,
+        max_shards: int = 10,
+        byte_budget: int = 1 << 30,
+        latency_budget_ms: float | None = None,
+        minimum_score: float = 0.0,
+        minimum_marginal_gain: float | None = None,
+        confidence_target: float | None = None,
+        maximum_remaining_score: float | None = None,
     ) -> None:
-        if max_shards <= 0 or byte_budget <= 0 or minimum_score < 0:
+        if (
+            max_shards <= 0
+            or byte_budget <= 0
+            or minimum_score < 0
+            or (minimum_marginal_gain is not None and minimum_marginal_gain < 0)
+            or (confidence_target is not None and not 0 < confidence_target <= 1)
+            or (maximum_remaining_score is not None and maximum_remaining_score < 0)
+            or (latency_budget_ms is not None and latency_budget_ms <= 0)
+        ):
             raise ValueError("max_shards and byte_budget must be positive; minimum_score must be non-negative")
         self.metadata = metadata
         self.max_shards = max_shards
         self.byte_budget = byte_budget
+        self.latency_budget_ms = latency_budget_ms
         self.minimum_score = minimum_score
+        self.minimum_marginal_gain = minimum_marginal_gain
+        self.confidence_target = confidence_target
+        self.maximum_remaining_score = maximum_remaining_score
 
     def plan(self, query: str, *, language: str | None = None) -> QueryPlan:
-        terms = _terms(query)
+        analysis = analyze_query(query)
+        terms = analysis.tokens
         planned: list[PlannedShard] = []
         for shard in self.metadata.shards:
             if language and shard.languages and language not in shard.languages:
                 continue
-            exact = tuple(term for term in terms if term in shard.terms)
-            bloom_only = tuple(term for term in terms if term not in exact and shard.bloom.may_contain(term))
+            exact = tuple(term for term in terms if shard.has_exact_term(term))
+            bloom_only = tuple(term for term in terms if term not in exact and shard.may_have_term(term))
             if not exact and not bloom_only:
                 continue
             score = 2.0 * len(exact) + len(bloom_only) + min(max(shard.hotness, 0.0), 1.0) * 0.01
@@ -172,16 +237,59 @@ class QueryPlanner:
             planned.append(PlannedShard(shard.shard_id, score, reasons, shard.byte_size))
         chosen: list[PlannedShard] = []
         opened = 0
+        estimated_latency_ms = 0.0
         stopped_early = False
-        for shard in sorted(planned, key=lambda item: (-item.score, item.shard_id)):
+        stop_reason: str | None = None
+        budget_exhausted = False
+        ordered = sorted(planned, key=lambda item: (-item.score, item.shard_id))
+        total_score = sum(shard.score for shard in ordered)
+        selected_score = 0.0
+        for position, shard in enumerate(ordered):
             if shard.score < self.minimum_score:
                 stopped_early = True
+                stop_reason = "minimum_score"
                 break
-            if len(chosen) == self.max_shards or opened + shard.byte_size > self.byte_budget:
+            if self.minimum_marginal_gain is not None and shard.score < self.minimum_marginal_gain:
+                stopped_early = True
+                stop_reason = "marginal_gain"
+                break
+            if (
+                len(chosen) == self.max_shards
+                or opened + shard.byte_size > self.byte_budget
+                or (
+                    self.latency_budget_ms is not None
+                    and estimated_latency_ms + self._estimated_open_ms(shard) > self.latency_budget_ms
+                )
+            ):
+                budget_exhausted = True
                 continue
             chosen.append(shard)
             opened += shard.byte_size
-        return QueryPlan(query, tuple(chosen), self.max_shards, self.byte_budget, stopped_early)
+            estimated_latency_ms += self._estimated_open_ms(shard)
+            selected_score += shard.score
+            remaining_score = sum(item.score for item in ordered[position + 1 :])
+            if self.confidence_target is not None and selected_score / total_score >= self.confidence_target:
+                stopped_early = True
+                stop_reason = "confidence"
+                break
+            if self.maximum_remaining_score is not None and remaining_score <= self.maximum_remaining_score:
+                stopped_early = True
+                stop_reason = "remaining_score"
+                break
+        return QueryPlan(
+            analysis.normalized,
+            tuple(chosen),
+            self.max_shards,
+            self.byte_budget,
+            stopped_early,
+            analysis,
+            estimated_latency_ms,
+            stop_reason,
+            budget_exhausted,
+        )
+
+    def _estimated_open_ms(self, planned: PlannedShard) -> float:
+        return next(shard.estimated_open_ms for shard in self.metadata.shards if shard.shard_id == planned.shard_id)
 
 
 def _terms(value: str) -> tuple[str, ...]:

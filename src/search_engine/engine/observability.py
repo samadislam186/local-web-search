@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,7 +28,7 @@ class MetricsRegistry:
     def __init__(self) -> None:
         self._lock = Lock()
         self._counters: dict[str, int] = defaultdict(int)
-        self._observations: dict[str, list[float]] = defaultdict(list)
+        self._observations: dict[str, dict[str, float]] = {}
 
     def increment(self, name: str, amount: int = 1) -> None:
         if amount < 0:
@@ -36,17 +37,20 @@ class MetricsRegistry:
             self._counters[name] += amount
 
     def observe(self, name: str, value: float) -> None:
-        if value < 0:
+        if not math.isfinite(value) or value < 0:
             raise ValueError("metric observation must not be negative")
         with self._lock:
-            self._observations[name].append(value)
+            item = self._observations.setdefault(name, {"count": 0.0, "sum": 0.0, "min": value, "max": value})
+            item["count"] += 1
+            item["sum"] += value
+            item["min"] = min(item["min"], value)
+            item["max"] = max(item["max"], value)
 
     def snapshot(self) -> MetricSnapshot:
         with self._lock:
             observations = {
-                name: {"count": float(len(values)), "min": min(values), "max": max(values), "mean": sum(values) / len(values)}
+                name: {"count": values["count"], "min": values["min"], "max": values["max"], "mean": values["sum"] / values["count"]}
                 for name, values in self._observations.items()
-                if values
             }
             return MetricSnapshot(dict(self._counters), observations)
 
@@ -84,7 +88,7 @@ def log_event(logger: logging.Logger, event: str, **fields: object) -> None:
     forbidden = _SENSITIVE_FIELDS & fields.keys()
     if forbidden:
         raise ValueError(f"sensitive event fields are not allowed: {sorted(forbidden)!r}")
-    logger.info(event, extra={"event_fields": fields})
+    logger.info(event, extra={"event_fields": fields, "event_correlation_id": _CORRELATION_ID.get()})
 
 
 class JsonEventFormatter(logging.Formatter):
@@ -97,7 +101,7 @@ class JsonEventFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "event": record.getMessage(),
-            "correlation_id": _CORRELATION_ID.get(),
+            "correlation_id": getattr(record, "event_correlation_id", _CORRELATION_ID.get()),
             "fields": fields,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)

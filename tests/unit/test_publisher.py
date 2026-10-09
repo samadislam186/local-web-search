@@ -5,6 +5,8 @@ from search_engine.identity import UrlId
 from search_engine.index import Bm25fIndex, SearchDocument
 from search_engine.publisher import load_active_search_service, publish_lexical_generation
 
+from search_engine.api import create_generation_app
+
 
 def _document(url: str, title: str, body: str) -> SearchDocument:
     canonical = canonicalize_url(url)
@@ -27,6 +29,13 @@ def test_published_generation_loads_as_read_only_search_service(tmp_path: Path) 
         tmp_path, require_signatures=False, minimum_routing_score=3.0
     ).search("python")
     assert restricted.results == ()
+
+
+def test_generation_app_factory_needs_only_published_artifacts(tmp_path: Path) -> None:
+    document = _document("https://example.com/python", "Python", "crawler")
+    publish_lexical_generation(tmp_path, "g000003", {"python": (document,)})
+    _app, service = create_generation_app(tmp_path, require_signatures=False)
+    assert service.search("python").results[0].hit.url == document.url
 
 
 def test_publisher_splits_serialized_indexes_to_the_configured_payload_target(tmp_path: Path) -> None:

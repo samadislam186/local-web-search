@@ -3,11 +3,14 @@ from search_engine.identity import UrlId
 from search_engine.index import SearchDocument
 from search_engine.routing_experiment import (
     assignment_balance_report,
+    assignment_sweep_report,
+    compare_assignment_sweeps,
     compare_assignments,
     domain_assignment,
     exhaustive_oracle,
     hash_assignment,
     run_experiment,
+    select_routing_strategy,
     sweep_shard_budgets,
 )
 
@@ -44,3 +47,11 @@ def test_routing_experiment_measures_oracle_containment_under_budget(tmp_path) -
     output = tmp_path / "routing-report.json"
     sweep.write_json(output, (1, 2))
     assert '"max_shards": 1' in output.read_text(encoding="utf-8")
+    compared = compare_assignment_sweeps(documents, ("python crawler",), shard_count=2)
+    comparison_report = assignment_sweep_report(compared, (1, 2, 5, 10))
+    assert set(comparison_report["assignments"]) == {"domain", "hash", "hybrid"}
+    assert comparison_report["shard_budgets"] == (1, 2, 5, 10)
+    selected = select_routing_strategy(compared, (1, 2, 5, 10), minimum_containment=0.5)
+    assert selected.outcome == "select" and selected.assignment is not None
+    revise = select_routing_strategy(compared, (1, 2, 5, 10), minimum_containment=1.0)
+    assert revise.outcome in {"select", "revise"}

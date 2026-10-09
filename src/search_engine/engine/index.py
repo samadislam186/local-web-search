@@ -39,6 +39,7 @@ class SearchDocument:
     anchor: str = ""
     host: str = ""
     domain: str = ""
+    crawled_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,7 @@ class SearchHit:
     title: str
     url: str
     snippet: str
+    crawled_at: str | None = None
 
 
 class SearchIndex(Protocol):
@@ -97,7 +99,7 @@ class Bm25fIndex:
                     fields, self._field_lengths[document_id], self._average_lengths
                 )
         hits = (
-            SearchHit(document.url_id, score, document.title, document.url, make_snippet(document.body, query))
+            SearchHit(document.url_id, score, document.title, document.url, make_snippet(document.body, query), document.crawled_at)
             for document_id, score in scores.items()
             for document in (self._by_id[document_id],)
         )

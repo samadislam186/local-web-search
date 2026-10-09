@@ -1,5 +1,7 @@
 import base64
+import errno
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,30 @@ def test_bad_generation_never_replaces_active_generation(tmp_path: Path) -> None
     assert store.active_manifest().generation == "g000001"
 
 
+@pytest.mark.parametrize("missing", ("manifest.json", "documents/part-0001.shard"))
+def test_missing_next_generation_file_preserves_active_generation(
+    tmp_path: Path, missing: str
+) -> None:
+    store = _published_generation(tmp_path, "g1")
+    _published_generation(tmp_path, "g2")
+    store.activate("g1")
+    # Simulate an incomplete transfer using only files created by this fixture.
+    (store.generations / "g2" / missing).unlink()
+    with pytest.raises(ArtifactValidationError):
+        store.activate("g2")
+    assert store.active_manifest().generation == "g1"
+
+
+def test_corrupt_active_pointer_can_be_recovered_by_explicit_validated_rollback(tmp_path: Path) -> None:
+    store = _published_generation(tmp_path, "g1")
+    store.activate("g1")
+    store.active_path.write_bytes(b"incomplete pointer")
+    with pytest.raises(ArtifactValidationError, match="active generation"):
+        store.active_manifest()
+    assert store.rollback("g1").generation == "g1"
+    assert store.active_manifest().generation == "g1"
+
+
 def test_generation_rollback_and_interrupted_publication_inspection(tmp_path: Path) -> None:
     store = _published_generation(tmp_path, "g1")
     _published_generation(tmp_path, "g2")
@@ -162,6 +188,34 @@ def test_failed_activation_keeps_prior_generation_and_removes_temporary_pointer(
 
     assert store.active_manifest().generation == "g1"
     assert not tuple(store.root.glob(".active.json.*"))
+
+
+def test_disk_full_during_pointer_flush_preserves_active_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _published_generation(tmp_path, "g1")
+    _published_generation(tmp_path, "g2")
+    store.activate("g1")
+
+    def disk_full(_descriptor: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(manifest_module.os, "fsync", disk_full)
+    with pytest.raises(ArtifactValidationError, match="No space left"):
+        store.activate("g2")
+    assert store.active_manifest().generation == "g1"
+    assert not tuple(store.root.glob(".active.json.*"))
+
+
+@pytest.mark.parametrize("version_field", ("format_version", "canonicalization_version", "url_id_version"))
+def test_incompatible_manifest_preserves_prior_active_generation(tmp_path: Path, version_field: str) -> None:
+    store = _published_generation(tmp_path, "g1")
+    store.activate("g1")
+    manifest = replace(Manifest.create("g2", ()), **{version_field: 999})
+    store.write_generation(manifest)
+    with pytest.raises(ArtifactValidationError):
+        store.activate("g2")
+    assert store.active_manifest().generation == "g1"
 
 
 def test_generation_manifest_cannot_be_rewritten_with_different_artifacts(tmp_path: Path) -> None:

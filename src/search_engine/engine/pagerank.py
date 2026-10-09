@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import perf_counter
 
 from .graph import HyperlinkGraph
+from .observability import MetricsRegistry, log_event
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,11 +28,14 @@ def compute_pagerank(
     tolerance: float = 1e-10,
     max_iterations: int = 100,
     progress: Callable[[int, float], None] | None = None,
+    metrics: MetricsRegistry | None = None,
 ) -> PageRankResult:
     """Compute stationary authority with damping and dangling-node redistribution."""
     if not 0 < damping < 1 or tolerance <= 0 or max_iterations <= 0:
         raise ValueError("invalid PageRank parameters")
     node_count = len(graph.ordinals.url_ids)
+    metrics = metrics or MetricsRegistry()
+    started = perf_counter()
     if node_count == 0:
         return PageRankResult((), 0, True)
     outgoing = tuple(graph.outgoing(node) for node in range(node_count))
@@ -50,6 +56,12 @@ def compute_pagerank(
         scores = next_scores
         if progress is not None:
             progress(iteration, delta)
+        metrics.observe("pagerank_delta", delta)
+        metrics.increment("pagerank_iterations")
         if delta <= tolerance:
+            metrics.observe("pagerank_latency_ms", (perf_counter() - started) * 1000)
+            log_event(logging.getLogger(__name__), "pagerank_completed", nodes=node_count, iterations=iteration, converged=True)
             return PageRankResult(tuple(scores), iteration, True)
+    metrics.observe("pagerank_latency_ms", (perf_counter() - started) * 1000)
+    log_event(logging.getLogger(__name__), "pagerank_completed", nodes=node_count, iterations=max_iterations, converged=False)
     return PageRankResult(tuple(scores), max_iterations, False)
