@@ -1,0 +1,16 @@
+# Allowlist the build inputs. Databases, artifacts, private keys, Git metadata,
+# tests, benchmarks and locally retained documentation never enter the context.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!src/
+!src/**
+!config/
+!config/**
+src/**/__pycache__/
+src/**/*.pyc
+**/*.pem
+**/*.key
+**/*.sqlite*
+**/.env*

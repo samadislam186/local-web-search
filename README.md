@@ -6,10 +6,19 @@ Tantivy; a reference BM25F implementation is available for small experiments.
 
 ## Install and test
 
+Install locally on the machine that will crawl and build the index. Docker below
+is **search hosting only**; it never crawls or builds an index.
+
 ```powershell
 python -m pip install -e ".[dev,tantivy,performance]"
 python scripts/ci.py
 ```
+
+Using a virtual environment is recommended: run `python -m venv .venv`, then
+`.venv\Scripts\Activate.ps1` on Windows or `source .venv/bin/activate` on Linux/macOS
+before installing. For matching native indexes and the default Docker image,
+install `python -m pip install "tantivy==0.26.2"`. The reader requires the exact
+Tantivy binding version recorded by the builder.
 
 `performance` installs psutil for cross-platform RSS, process read-byte counters,
 and resident native-index mapping observations. Missing measurements are null
@@ -25,7 +34,12 @@ python scripts/demo_index.py .demo-run-example
 ```
 
 The demo defaults to Tantivy; use `--backend reference` for a dependency-light
-reference run. To build a native index from your crawl database, use the CLI:
+reference run. Its ready-to-serve artifact root is `.demo-run-example/artifacts`.
+
+## Crawl and build an index locally
+
+Run these commands outside Docker. Seeds are URLs, not searchable documents:
+liveness and crawling must first fetch and persist their content.
 
 ```powershell
 open-search init-state crawl.sqlite3
@@ -35,6 +49,16 @@ open-search run-crawl crawl.sqlite3 --max-jobs 100
 open-search build-index crawl.sqlite3 artifacts g000001 --backend tantivy --max-documents 10000 --shard-count 10 --profile laptop
 open-search serve artifacts --allow-unsigned-local --profile laptop
 ```
+
+`run-liveness` and `run-crawl` process bounded batches. Repeat them as more URLs
+are discovered; use `run-crawl ... --continuous` for a sustained crawl. Respect
+robots rules and host delays. If no eligible documents were fetched, there is
+nothing to index. `inspect-state crawl.sqlite3` shows lifecycle and frontier counts.
+For another pending batch or update, build a new generation, for example
+`open-search build-index crawl.sqlite3 artifacts g000002 --backend tantivy --max-documents 10000 --shard-count 10 --profile laptop`.
+Publication updates `artifacts/active.json`; the complete artifact root must remain
+available, including `generations/`. Keep old generations until all serving
+processes using them have stopped, and retain a known-good generation for rollback.
 
 Serving defaults to `127.0.0.1:8080`. Crawl/build commands and serving are separate
 processes; normal search reads artifact generations and does not open crawl
@@ -78,7 +102,7 @@ For a signed native build, provide an existing unencrypted Ed25519 private PEM
 file and its key ID. The private key is used only by the build process:
 
 ```powershell
-open-search build-index crawl.sqlite3 artifacts g000002 --backend tantivy --signing-key release-private.pem --signing-key-id release-1
+open-search build-index crawl.sqlite3 artifacts g000003 --backend tantivy --signing-key release-private.pem --signing-key-id release-1
 open-search serve artifacts --pinned-key "release-1=BASE64_RAW_ED25519_PUBLIC_KEY"
 ```
 
@@ -88,6 +112,73 @@ key passed to serving must be the trusted 32-byte Ed25519 key encoded as base64.
 artifacts. Native packages record the exact Tantivy binding version; a mismatch
 requires a compatible installation or a rebuild.
 
+## Docker: host an existing index only
+
+Docker with Linux containers is required. Build the serving image from this
+repository (this builds/installs the Python package, **not** the search index):
+
+```powershell
+docker build -t local-web-search:serve .
+```
+
+The image runs as UID/GID `10001`, binds to `0.0.0.0:8080` inside the container,
+and fixes the entrypoint to `open-search serve /indexes`. It defaults to the
+`laptop` profile; use `--profile server` only when the host has suitable capacity.
+No corpus, crawl database,
+or signing key is baked into it. The build context allowlist excludes those files.
+Grant the container user read/traverse access to the host artifact directory; do
+not make the index world-writable. The default native binding is `0.26.2`; for an
+index built with another supported version, use
+`docker build --build-arg TANTIVY_VERSION=YOUR_EXACT_VERSION -t local-web-search:serve .`.
+Architecture-specific wheel availability and cross-platform native-index
+compatibility must be tested for your target host.
+
+Mount the **whole artifact root**, not an individual shard or generation. For
+locally built, trusted unsigned artifacts, use PowerShell:
+
+```powershell
+$indexPath = (Resolve-Path ./artifacts).Path
+docker run -d --name local-web-search --restart unless-stopped --stop-timeout 120 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=1g -p 127.0.0.1:8080:8080 --mount "type=bind,source=$indexPath,target=/indexes,readonly" local-web-search:serve --profile laptop --allow-unsigned-local
+```
+
+Or Linux/macOS:
+
+```bash
+docker run -d --name local-web-search --restart unless-stopped --stop-timeout 120 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=1g -p 127.0.0.1:8080:8080 --mount "type=bind,source=$(pwd)/artifacts,target=/indexes,readonly" local-web-search:serve --profile laptop --allow-unsigned-local
+```
+
+For the demo, replace the host artifact path with `.demo-run-example/artifacts`.
+For signed releases, replace `--allow-unsigned-local` with
+`--pinned-key "release-1=BASE64_RAW_ED25519_PUBLIC_KEY"`. Repeat `--pinned-key` for
+multiple trusted keys. Verification is required by default: startup fails if no
+pinned key is supplied unless unsigned-local mode is explicitly selected. Only
+public keys belong in serving options; never mount the builder's private key.
+
+`/tmp` is needed for native reader extraction even though indexes are read-only.
+Size its tmpfs for your workload; tmpfs consumes container/host memory. The
+`laptop` and `server` profiles bound cached payloads, not total native RSS or peak
+temporary reader usage. Set deployment memory/disk limits after measuring them.
+For persistent opt-in feedback, mount a separate writable directory and use
+`--enable-local-feedback --feedback-db /feedback/feedback.sqlite3 --feedback-salt-hex YOUR_SECRET_HEX_SALT`;
+the index volume should stay read-only. Protect the salt and feedback data.
+
+```powershell
+docker logs local-web-search
+docker inspect --format '{{.State.Health.Status}}' local-web-search
+Invoke-RestMethod http://127.0.0.1:8080/health
+```
+
+Startup validates the active generation; health reports process/API liveness,
+not complete corpus quality. Large generations can take longer than the default
+60-second health-check startup period; override `--health-start-period` as needed.
+After building/activating a new generation **on the host**, run
+`docker restart local-web-search` to load it. Serving pins its startup generation;
+it does not rebuild or automatically hot-swap indexes. Stop it with
+`docker stop local-web-search`. Keep the published port bound to loopback as shown
+unless an authenticated, TLS-enabled proxy protects access; the API itself does
+not implement authentication. Docker restart policies restart exited containers,
+not merely unhealthy ones.
+
 ## Query and diagnostics
 
 ```powershell
@@ -95,6 +186,17 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/search -Method Post -ContentType ap
 Invoke-RestMethod http://127.0.0.1:8080/metrics
 open-search benchmark-search artifacts python --allow-unsigned-local --runs 20 --warmup-runs 1
 ```
+
+For Linux/macOS, query either the local server or Docker-hosted server with:
+
+```bash
+curl --fail http://127.0.0.1:8080/search -H 'Content-Type: application/json' -d '{"query":"python","top_k":10,"explain":true}'
+curl --fail http://127.0.0.1:8080/version
+```
+
+Search only retrieves documents already in the published index; queries do not
+crawl the live web. Omit `freshness` to search all observation ages. `/version`
+reports the loaded generation, and `/stats` shows shard-cache usage.
 
 Freshness means crawl observation time, with day/week/month/year windows.
 Unknown, invalid, and future timestamps are excluded when a window is requested.
