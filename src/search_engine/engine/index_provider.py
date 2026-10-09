@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Protocol
 
@@ -48,6 +49,8 @@ class ManifestIndexProvider:
         )
         self._read_bytes = 0
         self._load_ms = 0.0
+        self._lifecycle_lock = RLock()
+        self._closed = False
 
     def get(self, shard_id: str) -> SearchIndex | None:
         entry = self._paths.get(shard_id)
@@ -66,7 +69,15 @@ class ManifestIndexProvider:
             self._load_ms += (perf_counter() - started) * 1000
             return result
 
-        return self._cache.get_or_load(shard_id, payload_size, load)
+        with self._lifecycle_lock:
+            if self._closed:
+                raise ArtifactValidationError("index provider is closed")
+            return self._cache.get_or_load(shard_id, payload_size, load)
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            self._closed = True
+            self._cache.clear()
 
     def stats(self) -> dict[str, int]:
         snapshot = self._cache.snapshot()

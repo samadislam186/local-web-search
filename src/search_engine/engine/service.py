@@ -13,6 +13,7 @@ from .feedback import FeedbackEvent, FeedbackKind, LocalFeedbackAggregator, clas
 from .index import SearchHit, SearchIndex
 from .index_provider import IndexProvider, InMemoryIndexProvider
 from .observability import MetricsRegistry, log_event
+from .query_analysis import normalize_domain
 from .ranking import LinearRanker, RankedHit, RankingSignals
 from .routing import QueryPlan, QueryPlanner
 
@@ -51,6 +52,12 @@ class SearchService:
         self.feedback_salt = feedback_salt
         self.per_shard_top_k = per_shard_top_k
 
+    def close(self) -> None:
+        """Release provider-owned readers after the server has drained requests."""
+        close = getattr(self.indexes, "close", None)
+        if close is not None:
+            close()
+
     def record_feedback(self, query: str, url_id: str, kind: FeedbackKind) -> None:
         """Record an opt-in local signal for a later query; immutable artifacts are untouched."""
         if self.feedback is None or self.feedback_salt is None:
@@ -76,21 +83,22 @@ class SearchService:
         if offset < 0:
             raise ValueError("offset must not be negative")
         started = perf_counter()
-        plan = self.planner.plan(query, language=language)
+        checked_at = now or datetime.now(UTC)
+        plan = self.planner.plan(query, language=language, domain_filter=domain_filter, freshness=freshness, now=checked_at)
         self.metrics.observe("planner_latency_ms", (perf_counter() - started) * 1000)
         effective_freshness = freshness or (plan.analysis.freshness if plan.analysis else None)
         windows = {"day": 1, "week": 7, "month": 30, "year": 365}
         if effective_freshness is not None and effective_freshness not in windows:
             raise ValueError("freshness must be day, week, month, or year")
-        checked_at = now or datetime.now(UTC)
         if checked_at.tzinfo is None:
             raise ValueError("now must be timezone-aware")
         cutoff = checked_at - timedelta(days=windows[effective_freshness]) if effective_freshness else None
-        searchable = " ".join(
+        searchable = plan.analysis.searchable if plan.analysis else " ".join(
             part for part in query.split()
             if not part.casefold().startswith(("site:", "domain:", "freshness:"))
         )
         effective_domain_filter = domain_filter or (plan.analysis.domain_filter if plan.analysis else None)
+        effective_domain_filter = normalize_domain(effective_domain_filter) if effective_domain_filter else None
         merged: dict[str, SearchHit] = {}
         requested = top_k + offset
         local_k = min(max(requested * 10, 100), self.per_shard_top_k)

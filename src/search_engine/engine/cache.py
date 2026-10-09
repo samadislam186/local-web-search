@@ -79,7 +79,9 @@ class BoundedShardCache(Generic[K, V]):
         self.max_entries = max_entries
         self.max_bytes = max_bytes
         self._values: OrderedDict[K, tuple[V, int]] = OrderedDict()
-        self._frequency: dict[K, int] = {}
+        self._frequency: OrderedDict[K, int] = OrderedDict()
+        self.max_frequency_entries = max(1024, max_entries * 8)
+        self._frequency_samples = 0
         self._active_bytes = 0
         self._lock = RLock()
         self.hits = 0
@@ -92,7 +94,13 @@ class BoundedShardCache(Generic[K, V]):
         # Serialize miss/admission accounting so simultaneous requests cannot
         # over-admit beyond either configured capacity bound.
         with self._lock:
-            self._frequency[key] = self._frequency.get(key, 0) + 1
+            self._frequency_samples += 1
+            if self._frequency_samples >= self.max_frequency_entries * 10:
+                self._frequency = OrderedDict((item, count // 2) for item, count in self._frequency.items() if count > 1)
+                self._frequency_samples = 0
+            self._frequency[key] = min(self._frequency.pop(key, 0) + 1, 65535)
+            while len(self._frequency) > self.max_frequency_entries:
+                self._frequency.popitem(last=False)
             resident = self._values.pop(key, None)
             if resident is not None:
                 self._values[key] = resident
@@ -106,6 +114,14 @@ class BoundedShardCache(Generic[K, V]):
     def snapshot(self) -> CacheSnapshot:
         with self._lock:
             return CacheSnapshot(len(self._values), self._active_bytes, self.hits, self.misses, self.rejections)
+
+    def clear(self) -> None:
+        """Release cache-owned references without closing objects still in use."""
+        with self._lock:
+            self._values.clear()
+            self._frequency.clear()
+            self._frequency_samples = 0
+            self._active_bytes = 0
 
     def _admit(self, key: K, value: V, size: int) -> None:
         while self._values and (len(self._values) >= self.max_entries or self._active_bytes + size > self.max_bytes):

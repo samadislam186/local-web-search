@@ -241,12 +241,11 @@ def run_experiment(
     routing = RoutingMetadata(
         "experiment",
         tuple(
-            ShardRoutingMetadata.from_terms(
+            ShardRoutingMetadata.from_documents(
                 shard_id,
                 "experiment",
-                len(documents),
                 max(1, len(Bm25fIndex(documents).to_payload())),
-                _terms(documents),
+                documents,
             )
             for shard_id, documents in sorted(segments.items())
         ),

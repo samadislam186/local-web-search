@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
@@ -34,7 +35,14 @@ class FeedbackRequest(BaseModel):
 
 
 def create_app(service: SearchService, *, generation: str) -> FastAPI:
-    app = FastAPI(title="OpenSearch Local", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            service.close()
+
+    app = FastAPI(title="OpenSearch Local", version="0.1.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def request_context(request, call_next):

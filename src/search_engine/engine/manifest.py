@@ -15,11 +15,12 @@ from .storage import (
     ArtifactValidationError,
     ShardArtifact,
     ShardHeader,
-    read_shard,
+    iter_shard_payload,
+    read_shard_header,
     safe_shard_relative_path,
 )
 
-MANIFEST_FORMAT_VERSION = 1
+MANIFEST_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +112,8 @@ class ManifestStore:
         try:
             data = json.loads(path.read_text("utf-8"))
             artifacts = tuple(
-                ShardArtifact(relative_path=item["relative_path"], header=ShardHeader(**item["header"]))
+                ShardArtifact(relative_path=item["relative_path"], header=ShardHeader(**item["header"]),
+                              source_generation=item.get("source_generation"))
                 for item in data.pop("artifacts")
             )
             if "source_crawls" in data:
@@ -125,7 +127,7 @@ class ManifestStore:
         generation = safe_generation(generation)
         self._verify_manifest_signature(generation)
         manifest = self.load_generation(generation)
-        if manifest.format_version != MANIFEST_FORMAT_VERSION or manifest.generation != generation:
+        if manifest.format_version not in {1, MANIFEST_FORMAT_VERSION} or manifest.generation != generation:
             raise ArtifactValidationError("manifest generation or format mismatch")
         _validate_manifest_metadata(manifest)
         seen: set[str] = set()
@@ -135,8 +137,14 @@ class ManifestStore:
                 raise ArtifactValidationError("duplicate artifact path")
             seen.add(artifact.relative_path)
             path = directory / safe_shard_relative_path(artifact.relative_path)
-            header, _ = read_shard(path)
-            if header != artifact.header or header.generation != generation:
+            header = read_shard_header(path)
+            for _chunk in iter_shard_payload(path):
+                pass
+            origin = artifact.source_generation if artifact.source_generation is not None else generation
+            safe_generation(origin)
+            if artifact.source_generation is not None and manifest.format_version < 2:
+                raise ArtifactValidationError("reused artifacts require manifest format 2")
+            if header != artifact.header or header.generation != origin:
                 raise ArtifactValidationError(f"manifest/shard mismatch: {artifact.relative_path}")
             if any(
                 manifest.dependencies.get(name) != version
@@ -249,7 +257,8 @@ class ManifestStore:
 def _manifest_to_json(manifest: Manifest) -> dict[str, object]:
     data = asdict(manifest)
     data["artifacts"] = [
-        {"relative_path": artifact.relative_path, "header": asdict(artifact.header)}
+        {"relative_path": artifact.relative_path, "header": asdict(artifact.header),
+         **({"source_generation": artifact.source_generation} if artifact.source_generation is not None else {})}
         for artifact in manifest.artifacts
     ]
     return data

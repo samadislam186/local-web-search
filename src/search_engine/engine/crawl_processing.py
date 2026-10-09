@@ -35,7 +35,8 @@ class CrawlResultProcessor:
     def __init__(self, candidates: CandidateRepository) -> None:
         self.candidates = candidates
 
-    def process_html(self, url_id: UrlId, html: str, *, redirect_target: str | None = None) -> CrawledDocument:
+    def process_html(self, url_id: UrlId, html: str, *, redirect_target: str | None = None,
+                     transition_state: bool = True) -> CrawledDocument:
         canonical = self.candidates.canonical_url(url_id)
         parsed = parse_html(html, canonical.value)
         discovered: list[UrlId] = []
@@ -44,10 +45,10 @@ class CrawlResultProcessor:
         for outgoing in parsed.outgoing_links:
             self._discover(outgoing, "crawled_link", canonical.value, discovered)
         current = self.candidates.get_state(url_id)
-        if current is UrlState.LIVE:
+        if transition_state and current is UrlState.LIVE:
             self.candidates.transition(url_id, UrlState.CRAWLABLE)
             current = UrlState.CRAWLABLE
-        if current is UrlState.CRAWLABLE:
+        if transition_state and current is UrlState.CRAWLABLE:
             self.candidates.transition(url_id, UrlState.CRAWLED)
         normalized_text = " ".join((parsed.title, " ".join(parsed.headings), parsed.main_text))
         return CrawledDocument(

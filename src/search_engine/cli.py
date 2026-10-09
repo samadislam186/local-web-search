@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from threading import Event
 
 from .api import create_generation_app
 from .config import load_profile
@@ -89,6 +91,7 @@ def _main() -> None:
     build_index.add_argument("--max-documents", type=int, default=10_000)
     build_index.add_argument("--shard-count", type=int, default=1)
     build_index.add_argument("--target-shard-bytes", type=int)
+    build_index.add_argument("--full-rebuild", action="store_true", help="rebuild every lexical shard instead of retaining unchanged ones")
     build_index.add_argument("--backend", choices=("reference", "tantivy"), default="tantivy")
     build_index.add_argument("--profile", choices=("tiny", "laptop", "server"))
     build_index.add_argument("--config-root", type=Path, default=Path("config"))
@@ -104,6 +107,8 @@ def _main() -> None:
     crawl_run.add_argument("--max-jobs", type=int, default=10)
     crawl_run.add_argument("--owner", default="local-cli")
     crawl_run.add_argument("--user-agent", default="OpenSearchLocalBot")
+    crawl_run.add_argument("--continuous", action="store_true")
+    crawl_run.add_argument("--idle-seconds", type=float, default=1.0)
     serve = commands.add_parser("serve")
     serve.add_argument("root", type=Path, help="published generation root")
     serve.add_argument("--host", default="127.0.0.1")
@@ -195,17 +200,21 @@ def _main() -> None:
             ),
             args.backend,
             signer,
+            args.full_rebuild,
         )
         print(f"generation={result.manifest.generation}")
         print(f"documents={result.document_count}")
         print(f"shards={result.shard_count}")
+        print(f"reused_shards={result.reused_shards}")
+        print(f"rebuilt_shards={result.rebuilt_shards}")
     elif args.command == "run-liveness":
         stats = _run_liveness(args.database, args.max_candidates, args.crawl_priority, args.live_recheck_hours)
         print(f"checked={stats.checked}")
         print(f"promoted_to_frontier={stats.promoted_to_frontier}")
         print(f"unavailable={stats.unavailable}")
     elif args.command == "run-crawl":
-        stats = _run_crawl(args.database, args.owner, args.max_jobs, args.user_agent)
+        stats = _run_crawl(args.database, args.owner, args.max_jobs, args.user_agent,
+                           continuous=args.continuous, idle_seconds=args.idle_seconds)
         print(f"attempted={stats.attempted}")
         print(f"completed={stats.completed}")
         print(f"requeued={stats.requeued}")
@@ -288,6 +297,7 @@ def _build_index(
     target_shard_payload_bytes: int | None = None,
     backend: str = "reference",
     signer: ReleaseSigner | None = None,
+    full_rebuild: bool = False,
 ) -> IndexBuildResult:
     database = CrawlStateDatabase(database_path)
     database.initialize()
@@ -299,6 +309,7 @@ def _build_index(
         target_shard_payload_bytes=target_shard_payload_bytes,
         backend=backend,
         signer=signer,
+        full_rebuild=full_rebuild,
     )
 
 
@@ -370,6 +381,8 @@ def _run_crawl(
     user_agent: str,
     *,
     probe: SafeHttpProbe | None = None,
+    continuous: bool = False,
+    idle_seconds: float = 1.0,
 ) -> CrawlRunStats:
     database = CrawlStateDatabase(database_path)
     database.initialize()
@@ -386,7 +399,18 @@ def _run_crawl(
         robots_check=lambda url: robots.check(url, user_agent),
         robots_delay=lambda url: robots.crawl_delay(url, user_agent),
     )
-    return CrawlerRunner(worker).run(owner, max_jobs=max_jobs)
+    runner = CrawlerRunner(worker)
+    if not continuous:
+        return runner.run(owner, max_jobs=max_jobs)
+    stop = Event()
+    previous = {kind: signal.getsignal(kind) for kind in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for kind in previous:
+            signal.signal(kind, lambda *_args: stop.set())
+        return runner.run_forever(owner, stop=stop, batch_size=max_jobs, idle_seconds=idle_seconds)
+    finally:
+        for kind, handler in previous.items():
+            signal.signal(kind, handler)
 
 
 def _parse_pinned_keys(values: list[str]) -> dict[str, str]:

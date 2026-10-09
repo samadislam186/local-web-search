@@ -42,6 +42,7 @@ class ShardHeader:
 class ShardArtifact:
     relative_path: str
     header: ShardHeader
+    source_generation: str | None = None
 
 
 def write_shard(

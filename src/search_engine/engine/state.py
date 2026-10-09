@@ -213,6 +213,8 @@ class CrawlStateDatabase:
                 PRIMARY KEY(crawl_id, partition)
             )""")
             connection.execute("CREATE INDEX IF NOT EXISTS frontier_ready ON frontier(available_at, priority DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS frontier_host_leases ON frontier(host, lease_expires_at)")
+            connection.execute("CREATE INDEX IF NOT EXISTS frontier_expired_leases ON frontier(lease_expires_at) WHERE lease_owner IS NOT NULL")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS crawled_documents_recent ON crawled_documents(crawled_at DESC, url_id)"
             )
@@ -645,17 +647,30 @@ class FrontierRepository:
         lease = self.lease_next_details(owner, now, lease_expires_at)
         return None if lease is None else lease.url_id
 
+    def owns_lease(self, url_id: UrlId, owner: str, attempt_count: int) -> bool:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM frontier WHERE url_id=? AND lease_owner=? AND attempt_count=?",
+                (url_id.value, owner, attempt_count),
+            ).fetchone() is not None
+
     def lease_next_details(self, owner: str, now: str, lease_expires_at: str) -> FrontierLease | None:
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            # A dead worker never calls complete(). Recalculate the derived
-            # host count from unexpired leases before choosing new work.
+            # Reclaim only expired hosts, rather than rewriting every host on
+            # every attempt (which otherwise continually amplifies WAL writes).
             connection.execute(
                 """UPDATE hosts SET active_leases=(
                     SELECT COUNT(*) FROM frontier
                     WHERE frontier.host=hosts.host AND frontier.lease_expires_at > ?
-                ), updated_at=?""",
-                (now, now),
+                ), updated_at=? WHERE host IN (
+                    SELECT host FROM frontier WHERE lease_owner IS NOT NULL AND lease_expires_at <= ?
+                )""",
+                (now, now, now),
+            )
+            connection.execute(
+                "UPDATE frontier SET lease_owner=NULL, lease_expires_at=NULL WHERE lease_owner IS NOT NULL AND lease_expires_at <= ?",
+                (now,),
             )
             row = connection.execute(
                 """SELECT frontier.url_id FROM frontier
@@ -684,11 +699,15 @@ class FrontierRepository:
         assert attempt is not None
         return FrontierLease(url_id, int(attempt["attempt_count"]))
 
-    def complete(self, url_id: UrlId, owner: str, next_allowed_at: str, error: str | None = None) -> None:
+    def complete(self, url_id: UrlId, owner: str, next_allowed_at: str, error: str | None = None,
+                 *, attempt_count: int | None = None) -> None:
         now = _now()
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT host FROM frontier WHERE url_id=? AND lease_owner=?", (url_id.value, owner)).fetchone()
+            row = connection.execute(
+                "SELECT host FROM frontier WHERE url_id=? AND lease_owner=? AND (? IS NULL OR attempt_count=?)",
+                (url_id.value, owner, attempt_count, attempt_count),
+            ).fetchone()
             if row is None:
                 connection.execute("ROLLBACK")
                 raise KeyError("lease not owned by caller")
@@ -706,14 +725,16 @@ class FrontierRepository:
             connection.execute("COMMIT")
 
     def release_for_retry(
-        self, url_id: UrlId, owner: str, available_at: str, error: str, *, next_allowed_at: str | None = None
+        self, url_id: UrlId, owner: str, available_at: str, error: str, *, next_allowed_at: str | None = None,
+        attempt_count: int | None = None,
     ) -> None:
         """Release a failed lease without dropping the URL from the frontier."""
         now = _now()
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT host FROM frontier WHERE url_id=? AND lease_owner=?", (url_id.value, owner)
+                "SELECT host FROM frontier WHERE url_id=? AND lease_owner=? AND (? IS NULL OR attempt_count=?)",
+                (url_id.value, owner, attempt_count, attempt_count),
             ).fetchone()
             if row is None:
                 connection.execute("ROLLBACK")

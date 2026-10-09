@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
 from .identity import UrlId
+from .query_analysis import analyze_query
+from .query_terms import TOKEN, one_edit_variants
 from .snippets import make_snippet
 
-_TOKEN = re.compile(r"[\w]{2,}", re.UNICODE)
+_TOKEN = TOKEN
 _FIELD_WEIGHTS: Mapping[str, float] = {
     "title": 3.0,
     "headings": 2.0,
@@ -85,8 +86,12 @@ class Bm25fIndex:
     def search(self, query: str, top_k: int) -> tuple[SearchHit, ...]:
         if top_k <= 0:
             raise ValueError("top_k must be positive")
+        analysis = analyze_query(query) if query.strip() else None
         query_terms = tuple(dict.fromkeys(_terms(query)))
-        candidate_ids = set().union(*(self._postings.get(term, {}) for term in query_terms)) if query_terms else set()
+        if analysis and analysis.fuzzy_terms:
+            query_terms = tuple(dict.fromkeys((*query_terms, *(candidate for term in analysis.fuzzy_terms
+                for candidate in one_edit_variants(term) if candidate in self._postings))))
+        candidate_ids = set().union(*(self._postings.get(term, {}) for term in query_terms)) if query_terms else set(self._by_id)
         scores: dict[str, float] = {candidate_id: 0.0 for candidate_id in candidate_ids}
         document_count = len(self.documents)
         for term in query_terms:
@@ -112,18 +117,27 @@ class Bm25fIndex:
 
     @classmethod
     def from_payload(cls, payload: bytes) -> Bm25fIndex:
+        return cls(documents_from_payload(payload))
+
+
+def documents_from_payload(payload: bytes) -> Iterator[SearchDocument]:
+    """Decode one source shard without constructing lexical postings for a rebuild."""
+    try:
+        records = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid lexical index payload") from exc
+    yield from documents_from_records(records)
+
+
+def documents_from_records(records: list[dict]) -> Iterator[SearchDocument]:
+    if not isinstance(records, list):
+        raise TypeError("invalid lexical document records")
+    for record in records:
         try:
-            records = json.loads(payload)
-            documents = tuple(
-                SearchDocument(
-                    url_id=UrlId(bytes.fromhex(record.pop("url_id"))),
-                    **record,
-                )
-                for record in records
-            )
-        except (TypeError, ValueError, json.JSONDecodeError, KeyError) as exc:
+            fields = {key: value for key, value in record.items() if key != "url_id"}
+            yield SearchDocument(url_id=UrlId(bytes.fromhex(record["url_id"])), **fields)
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
             raise ValueError("invalid lexical index payload") from exc
-        return cls(documents)
 
 
 def _terms(value: str) -> tuple[str, ...]:

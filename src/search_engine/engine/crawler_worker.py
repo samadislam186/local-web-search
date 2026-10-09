@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from uuid import uuid4
 
 from .crawl_processing import CrawledDocument, CrawlResultProcessor
 from .crawl_store import CrawledDocumentRepository
@@ -79,6 +80,8 @@ class CrawlerWorker:
         retry_at: str | None,
         next_allowed_at: str,
     ) -> CrawlAttemptResult:
+        # Fence across process restarts and re-enqueues, even with a reused CLI name.
+        owner = f"{owner}:{uuid4().hex}"
         lease = self.frontier.lease_next_details(owner, now, lease_expires_at)
         if lease is None:
             return CrawlAttemptResult(False, False, "frontier_empty")
@@ -94,11 +97,13 @@ class CrawlerWorker:
             allowed = decision is RobotsDecision.ALLOWED
         else:
             allowed = self.robots_allows(canonical.value)
+        if not self.frontier.owns_lease(url_id, owner, lease.attempt_count):
+            return CrawlAttemptResult(True, False, "lease_lost")
         if not allowed:
             current = self.candidates.get_state(url_id)
             if current is UrlState.CRAWLABLE:
                 self.candidates.transition(url_id, UrlState.LIVE_BUT_BLOCKED, "robots_disallow")
-            self.frontier.complete(url_id, owner, next_allowed_at, "robots_disallow")
+            self.frontier.complete(url_id, owner, next_allowed_at, "robots_disallow", attempt_count=lease.attempt_count)
             return CrawlAttemptResult(True, True, "robots_disallow")
         if self.robots_delay is not None:
             delay_seconds = self.robots_delay(canonical.value)
@@ -110,6 +115,8 @@ class CrawlerWorker:
             fetched = self.probe.probe(canonical.value)
         except Exception as exc:  # noqa: BLE001 - worker boundaries convert probe faults into retries.
             return self._retry(url_id, owner, now, retry_at, lease.attempt_count, f"probe:{type(exc).__name__}")
+        if not self.frontier.owns_lease(url_id, owner, lease.attempt_count):
+            return CrawlAttemptResult(True, False, "lease_lost")
         content_type = fetched.headers.get("content-type", "").split(";", 1)[0].lower()
         if fetched.status is None or not 200 <= fetched.status < 300:
             reason = fetched.error or f"http_status:{fetched.status}"
@@ -132,19 +139,20 @@ class CrawlerWorker:
             current = self.candidates.get_state(url_id)
             if current in {UrlState.LIVE, UrlState.CRAWLABLE}:
                 self.candidates.transition(url_id, UrlState.LIVE_BUT_UNUSABLE, reason)
-            self.frontier.complete(url_id, owner, next_allowed_at, reason)
+            self.frontier.complete(url_id, owner, next_allowed_at, reason, attempt_count=lease.attempt_count)
             return CrawlAttemptResult(True, True, reason)
         try:
             body = _decode_html_body(fetched.body, fetched.headers.get("content-type", ""))
-            if fetched.redirect_target is None:
-                document = self.processor.process_html(url_id, body)
-            else:
-                document = self.processor.process_html(url_id, body, redirect_target=fetched.redirect_target)
+            options = {"transition_state": False} if self.document_store is not None else {}
+            if fetched.redirect_target is not None:
+                options["redirect_target"] = fetched.redirect_target
+            document = self.processor.process_html(url_id, body, **options)
             if self.document_store is not None:
-                self.document_store.save(document)
+                self.document_store.save(document, lease_owner=owner, lease_attempt=lease.attempt_count,
+                                         transition_state=True)
         except Exception as exc:  # noqa: BLE001 - worker boundaries convert processing faults into retries.
             return self._retry(url_id, owner, now, retry_at, lease.attempt_count, f"processing:{type(exc).__name__}")
-        self.frontier.complete(url_id, owner, next_allowed_at)
+        self.frontier.complete(url_id, owner, next_allowed_at, attempt_count=lease.attempt_count)
         return CrawlAttemptResult(True, True, document=document)
 
     def _retry(
@@ -158,15 +166,18 @@ class CrawlerWorker:
         *,
         next_allowed_at: str | None = None,
     ) -> CrawlAttemptResult:
+        if not self.frontier.owns_lease(url_id, owner, attempt_count):
+            return CrawlAttemptResult(True, False, "lease_lost")
         if attempt_count >= self.retry_policy.max_attempts:
             current = self.candidates.get_state(url_id)
             if current in {UrlState.LIVE, UrlState.CRAWLABLE}:
                 self.candidates.transition(url_id, UrlState.TEMPORARILY_UNAVAILABLE, f"retry_exhausted:{reason}")
             exhausted_reason = f"retry_exhausted:{reason}"
-            self.frontier.complete(url_id, owner, next_allowed_at or now, exhausted_reason)
+            self.frontier.complete(url_id, owner, next_allowed_at or now, exhausted_reason, attempt_count=attempt_count)
             return CrawlAttemptResult(True, True, exhausted_reason)
         scheduled_retry = retry_at or _add_delay(now, self.retry_policy.delay_for_attempt(attempt_count))
-        self.frontier.release_for_retry(url_id, owner, scheduled_retry, reason, next_allowed_at=next_allowed_at)
+        self.frontier.release_for_retry(url_id, owner, scheduled_retry, reason, next_allowed_at=next_allowed_at,
+                                        attempt_count=attempt_count)
         return CrawlAttemptResult(True, False, reason)
 
 
